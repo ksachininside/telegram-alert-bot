@@ -1,105 +1,83 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import requests
 import time
 
-# Telegram Bot setup
-TELEGRAM_BOT_TOKEN = '7863373756:AAFSDz0KLem7tk-Tu02Zy4qPQQBF6gO3AtA'
-CHAT_ID = '972261464'
+# === Configuration ===
+SYMBOL = "^NSEI"
+EMA_PERIOD = 50
+ATR_PERIOD = 10
+ATR_MULTIPLIER = 3
+INTERVAL = "1h"
+LOOKBACK_DAYS = "7d"
 
+# === Telegram Bot ===
+BOT_TOKEN = "7863373756:AAE6q89x5ku5ZH2g1IZ789_879FI31Hra_M"
+CHAT_ID = "972261464"
+
+# === Send Telegram Message ===
 def send_telegram_message(message):
-    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-    payload = {'chat_id': CHAT_ID, 'text': message}
-    requests.post(url, data=payload)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        response = requests.post(url, json=payload)
+        print(response.json())
+    except Exception as e:
+        print("Telegram error:", e)
 
-# Calculate EMA
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-# Calculate ATR for Supertrend
-def atr(df, period=10):
-    df['H-L'] = df['High'] - df['Low']
-    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
-    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
-    tr = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr
-
-# Calculate Supertrend
+# === Supertrend Calculation ===
 def supertrend(df, period=10, multiplier=3):
-    atr_value = atr(df, period)
     hl2 = (df['High'] + df['Low']) / 2
-    upperband = hl2 + (multiplier * atr_value)
-    lowerband = hl2 - (multiplier * atr_value)
-    
-    supertrend = [True] * len(df)  # True = uptrend, False = downtrend
-    final_upperband = [0] * len(df)
-    final_lowerband = [0] * len(df)
-    
-    for i in range(1, len(df)):
-        final_upperband[i] = upperband[i] if (upperband[i] < final_upperband[i-1] or df['Close'][i-1] > final_upperband[i-1]) else final_upperband[i-1]
-        final_lowerband[i] = lowerband[i] if (lowerband[i] > final_lowerband[i-1] or df['Close'][i-1] < final_lowerband[i-1]) else final_lowerband[i-1]
+    df['ATR'] = df['High'].rolling(period).max() - df['Low'].rolling(period).min()
+    df['ATR'] = df['ATR'].rolling(period).mean()
 
-        if supertrend[i-1]:
-            supertrend[i] = df['Close'][i] > final_upperband[i]
+    df['UpperBand'] = hl2 + multiplier * df['ATR']
+    df['LowerBand'] = hl2 - multiplier * df['ATR']
+    df['Supertrend'] = True
+
+    for i in range(period, len(df)):
+        if df['Close'][i] > df['UpperBand'][i - 1]:
+            df['Supertrend'][i] = True
+        elif df['Close'][i] < df['LowerBand'][i - 1]:
+            df['Supertrend'][i] = False
         else:
-            supertrend[i] = df['Close'][i] < final_lowerband[i]
-    
-    df['Supertrend'] = supertrend
+            df['Supertrend'][i] = df['Supertrend'][i - 1]
+
+            if df['Supertrend'][i]:
+                df['LowerBand'][i] = max(df['LowerBand'][i], df['LowerBand'][i - 1])
+            else:
+                df['UpperBand'][i] = min(df['UpperBand'][i], df['UpperBand'][i - 1])
     return df
 
-# Strategy Logic: Supertrend + EMA crossover detection
-def check_signals(df):
-    signals = []
-    for i in range(1, len(df)):
-        # Get EMA and Supertrend direction
-        ema_current = df['EMA'][i]
-        ema_prev = df['EMA'][i-1]
-        close_current = df['Close'][i]
-        close_prev = df['Close'][i-1]
-        supertrend_current = df['Supertrend'][i]
-
-        # Price crosses EMA up/down
-        cross_up = close_prev < ema_prev and close_current > ema_current
-        cross_down = close_prev > ema_prev and close_current < ema_current
-
-        # Buy condition: Supertrend is uptrend (True) and price crosses EMA up or down
-        if supertrend_current and (cross_up or cross_down):
-            signals.append((df.index[i], "BUY Signal - Supertrend Up & Price crossed EMA"))
-
-        # Sell condition: Supertrend is downtrend (False) and price crosses EMA up or down
-        elif not supertrend_current and (cross_up or cross_down):
-            signals.append((df.index[i], "SELL Signal - Supertrend Down & Price crossed EMA"))
-
-    return signals
-
+# === Main Alert Logic ===
 def main():
-    symbol = '^NSEI'  # Nifty 50 index symbol on Yahoo Finance
-    period = '1d'      # Daily data, can change to '5m' or '15m' for intraday if available
-    atr_period = 10
-    atr_multiplier = 3
-    ema_length = 9
+    df = yf.download(SYMBOL, interval=INTERVAL, period=LOOKBACK_DAYS)
 
-    # Fetch historical data (last 60 days)
-    df = yf.download(symbol, period='60d', interval='1d')
-
-    if df.empty:
-        print("No data fetched, try again later")
+    if df.empty or len(df) < 50:
+        send_telegram_message("⚠️ Not enough data to calculate indicators.")
         return
 
-    df['EMA'] = ema(df['Close'], ema_length)
-    df = supertrend(df, period=atr_period, multiplier=atr_multiplier)
+    df['EMA'] = df['Close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df = supertrend(df, ATR_PERIOD, ATR_MULTIPLIER)
 
-    signals = check_signals(df)
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
 
-    if signals:
-        for date, message in signals:
-            alert_msg = f"{date.date()} - {message}"
-            print(alert_msg)
-            send_telegram_message(alert_msg)
+    message = None
+
+    # Example: EMA crossover with Supertrend confirmation
+    if previous['Close'] < previous['EMA'] and latest['Close'] > latest['EMA'] and latest['Supertrend']:
+        message = "🔔 Buy Signal: EMA crossover + Supertrend confirmation ✅"
+    elif previous['Close'] > previous['EMA'] and latest['Close'] < latest['EMA'] and not latest['Supertrend']:
+        message = "🔻 Sell Signal: EMA breakdown + Supertrend confirmation ❌"
+
+    if message:
+        send_telegram_message(message)
     else:
-        print("No signals generated.")
+        print("✅ No signal generated.")
 
+# === Loop (if running continuously) ===
 if __name__ == "__main__":
     main()
+    # To run every hour automatically on Render, set up a cron job in Render scheduler (optional)
